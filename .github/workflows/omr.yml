@@ -1,6 +1,10 @@
 # .github/workflows/omr.yml
-# Reads one photo of sheet music with Audiveris and saves the result as
-# jobs/<id>/result.mxl (or jobs/<id>/error.txt). Started by the sheet-omr Worker.
+# Reads one photo of sheet music with up to three engines in parallel:
+#   audiveris - classic optical music recognition, best on clean scans
+#   homr      - neural network made for camera photos
+#   oemer     - neural network, end-to-end
+# Each engine saves jobs/<id>/<engine>.<mxl|musicxml>.bin (encrypted) or
+# jobs/<id>/<engine>.err.txt. Started by the sheet-omr Worker.
 name: OMR
 
 on:
@@ -9,72 +13,54 @@ on:
       job_id:
         description: "Job id (set by the Worker)"
         required: true
+      engines:
+        description: "Comma-separated engines"
+        required: false
+        default: "audiveris,homr,oemer"
 
 permissions:
   contents: write
 
-concurrency:
-  group: omr-${{ inputs.job_id }}
-
 jobs:
-  omr:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    outputs:
+      engines: ${{ steps.e.outputs.list }}
     env:
       JOB_ID: ${{ inputs.job_id }}
-      OMR_KEY: ${{ secrets.OMR_KEY }}
+      ENGINES: ${{ inputs.engines }}
     steps:
-      - name: Check job id
+      - id: e
         run: |
           [[ "$JOB_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "Bad job id"; exit 1; }
+          list=""
+          for e in ${ENGINES//,/ }; do
+            case "$e" in audiveris|homr|oemer) list="$list,\"$e\"";; esac
+          done
+          [ -n "$list" ] || list=',"audiveris"'
+          echo "list=[${list#,}]" >> "$GITHUB_OUTPUT"
+          echo "Engines: [${list#,}]"
 
+  read:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: ${{ fromJSON(needs.plan.outputs.engines) }}
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      ENGINE: ${{ matrix.engine }}
+      OMR_KEY: ${{ secrets.OMR_KEY }}
+    steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: |
             jobs/${{ inputs.job_id }}
           sparse-checkout-cone-mode: false
 
-      - name: Find latest Audiveris release
-        id: rel
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          json=$(gh api repos/Audiveris/audiveris/releases/latest)
-          tag=$(echo "$json" | jq -r .tag_name)
-          url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("ubuntu.*24\\.04.*\\.deb$"; "i"))][0].browser_download_url // empty')
-          [ -n "$url" ] || url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("ubuntu.*\\.deb$"; "i"))][0].browser_download_url // empty')
-          [ -n "$url" ] || url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("\\.deb$"; "i"))][0].browser_download_url // empty')
-          [ -n "$url" ] || { echo "No Linux .deb in Audiveris $tag"; echo "$json" | jq -r '.assets[].name'; exit 1; }
-          echo "Audiveris $tag -> $url"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Audiveris installer
-        uses: actions/cache@v4
-        with:
-          path: ~/audiveris.deb
-          key: audiveris-deb-${{ steps.rel.outputs.tag }}
-
-      - name: Install Audiveris
-        run: |
-          [ -s ~/audiveris.deb ] || curl -fsSL -o ~/audiveris.deb "${{ steps.rel.outputs.url }}"
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq imagemagick xvfb python3-cryptography libasound2t64
-          # The installer's last step adds a desktop menu icon, which fails on a
-          # server with no desktop. Give it the folders it wants; if it still
-          # fails, unpack the program files directly (the menu icon isn't needed).
-          sudo mkdir -p /etc/xdg/menus /usr/share/desktop-directories /usr/share/applications /usr/share/icons/hicolor
-          if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$HOME/audiveris.deb"; then
-            echo "Package setup step failed - unpacking the program files directly"
-            sudo dpkg-deb -x "$HOME/audiveris.deb" /
-          fi
-          AUD=/opt/audiveris/bin/Audiveris
-          [ -x "$AUD" ] || AUD=$(dpkg-deb -c "$HOME/audiveris.deb" | awk '{print $NF}' | sed 's#^\.##' | grep -E '/bin/[Aa]udiveris$' | head -1)
-          [ -n "$AUD" ] && [ -x "$AUD" ] || { echo "Audiveris executable not found"; dpkg-deb -c "$HOME/audiveris.deb" | head -40; exit 1; }
-          echo "Using $AUD"
-          echo "AUD=$AUD" >> "$GITHUB_ENV"
-
-      - name: Write crypto helper
+      - name: Unlock the photo
         run: |
           mkdir -p work out
           cat > work/seal.py <<'PY'
@@ -91,49 +77,145 @@ jobs:
               out = n + aes.encrypt(n, data, None)
           open(dst, "wb").write(out)
           PY
+          python3 -c "import cryptography" 2>/dev/null || sudo apt-get install -y -qq python3-cryptography
+          d="jobs/$JOB_ID"
+          if [ ! -f "$d/input.bin" ]; then echo "READER: The photo didn't arrive." > "$d/$ENGINE.err.txt"; exit 0; fi
+          python3 work/seal.py dec "$d/input.bin" work/input.jpg || { echo "READER: The photo couldn't be unlocked (OMR_KEY mismatch)." > "$d/$ENGINE.err.txt"; exit 0; }
+          echo "Photo: $(stat -c %s work/input.jpg) bytes"
 
-      - name: Recognize
+      # ------------------------------------------------------------ Audiveris
+      - name: Find latest Audiveris release
+        if: matrix.engine == 'audiveris'
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          json=$(gh api repos/Audiveris/audiveris/releases/latest)
+          tag=$(echo "$json" | jq -r .tag_name)
+          url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("ubuntu.*24\\.04.*\\.deb$"; "i"))][0].browser_download_url // empty')
+          [ -n "$url" ] || url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("\\.deb$"; "i"))][0].browser_download_url // empty')
+          [ -n "$url" ] || { echo "No Linux .deb in Audiveris $tag"; exit 1; }
+          echo "Audiveris $tag -> $url"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Audiveris installer
+        if: matrix.engine == 'audiveris'
+        uses: actions/cache@v4
+        with:
+          path: ~/audiveris.deb
+          key: audiveris-deb-${{ steps.rel.outputs.tag }}
+
+      - name: Install Audiveris
+        if: matrix.engine == 'audiveris'
+        run: |
+          [ -s ~/audiveris.deb ] || curl -fsSL -o ~/audiveris.deb "${{ steps.rel.outputs.url }}"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq imagemagick xvfb libasound2t64
+          # The installer's last step adds a desktop menu icon, which fails on a
+          # server with no desktop; if so, unpack the program files directly.
+          sudo mkdir -p /etc/xdg/menus /usr/share/desktop-directories /usr/share/applications /usr/share/icons/hicolor
+          if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$HOME/audiveris.deb"; then
+            echo "Package setup step failed - unpacking the program files directly"
+            sudo dpkg-deb -x "$HOME/audiveris.deb" /
+          fi
+          [ -x /opt/audiveris/bin/Audiveris ] || { echo "Audiveris executable not found"; exit 1; }
+
+      - name: Read with Audiveris
+        if: matrix.engine == 'audiveris'
         run: |
           d="jobs/$JOB_ID"
-          [ -f "$d/input.bin" ] || { echo "READER: The photo didn't arrive." > "$d/error.txt"; exit 0; }
-          python3 work/seal.py dec "$d/input.bin" work/input.jpg || { echo "READER: The photo couldn't be unlocked (OMR_KEY mismatch)." > "$d/error.txt"; exit 0; }
-          in=work/input.jpg
-
-          # Clean up the photo: upright, grey, straightened, big enough, then a
-          # black-and-white version with local thresholding (handles uneven light).
-          convert "$in" -auto-orient -colorspace Gray -deskew 40% +repage \
+          [ -f work/input.jpg ] || exit 0
+          # upright, grey, straightened, big enough; plus a black-and-white version
+          convert work/input.jpg -auto-orient -colorspace Gray -deskew 40% +repage \
                   -resize '3000x3000<' -normalize work/gray.png
           convert work/gray.png -lat 60x60-8% work/bw.png
-
           run_aud () {
             rm -rf out/*
-            timeout 300 xvfb-run -a "$AUD" -batch -export -output out "$1" >> work/log.txt 2>&1 || true
+            timeout 300 xvfb-run -a /opt/audiveris/bin/Audiveris -batch -export -output out "$1" >> work/log.txt 2>&1 || true
             find out -name '*.mxl' | sort | head -1
           }
           m=""
-          for f in work/bw.png work/gray.png "$in"; do
+          for f in work/bw.png work/gray.png work/input.jpg; do
             echo "=== $f" >> work/log.txt
             m=$(run_aud "$f")
             [ -n "$m" ] && break
           done
-
           if [ -n "$m" ]; then
-            python3 work/seal.py enc "$m" "$d/result.bin"
-            echo "Result: $m"
+            python3 work/seal.py enc "$m" "$d/audiveris.mxl.bin"
+          elif grep -qiE 'too low|resolution|interline' work/log.txt; then
+            echo "READER: Staff lines too small or blurry - move closer so the staves fill the frame." > "$d/audiveris.err.txt"
           else
-            if grep -qiE 'too low|resolution|interline' work/log.txt; then
-              echo "READER: The staff lines were too small or blurry - move closer so the staves fill the frame." > "$d/error.txt"
-            else
-              echo "READER: No music could be recognized - try a flatter, sharper photo in even light." > "$d/error.txt"
-            fi
+            echo "READER: No music recognized." > "$d/audiveris.err.txt"
           fi
           tail -n 40 work/log.txt
 
+      # ----------------------------------------------------------------- homr
+      - uses: actions/setup-python@v5
+        if: matrix.engine == 'homr' || matrix.engine == 'oemer'
+        with:
+          python-version: "3.11"
+
+      - name: Cache homr (program and models)
+        if: matrix.engine == 'homr'
+        uses: actions/cache@v4
+        with:
+          path: ~/venv-homr
+          key: venv-homr-0.7.1-py311-v1
+
+      - name: Read with homr
+        if: matrix.engine == 'homr'
+        run: |
+          d="jobs/$JOB_ID"
+          [ -f work/input.jpg ] || exit 0
+          if [ ! -x ~/venv-homr/bin/homr ]; then
+            python -m venv ~/venv-homr
+            ~/venv-homr/bin/pip install -q --upgrade pip
+            ~/venv-homr/bin/pip install -q "homr[cpu]==0.7.1"
+          fi
+          ~/venv-homr/bin/homr --init --no-title
+          timeout 900 ~/venv-homr/bin/homr --no-title work/input.jpg 2>&1 | tail -n 40 || true
+          if [ -s work/input.musicxml ]; then
+            python3 work/seal.py enc work/input.musicxml "$d/homr.musicxml.bin"
+          else
+            echo "READER: No music recognized." > "$d/homr.err.txt"
+          fi
+
+      # ---------------------------------------------------------------- oemer
+      - name: Cache oemer (program and models)
+        if: matrix.engine == 'oemer'
+        uses: actions/cache@v4
+        with:
+          path: ~/venv-oemer
+          key: venv-oemer-0.1.8-py311-v1
+
+      - name: Read with oemer
+        if: matrix.engine == 'oemer'
+        run: |
+          d="jobs/$JOB_ID"
+          [ -f work/input.jpg ] || exit 0
+          if [ ! -x ~/venv-oemer/bin/oemer ]; then
+            python -m venv ~/venv-oemer
+            ~/venv-oemer/bin/pip install -q --upgrade pip
+            ~/venv-oemer/bin/pip install -q "oemer==0.1.8" "numpy<2"
+          fi
+          mkdir -p work/oemer
+          timeout 1200 ~/venv-oemer/bin/oemer work/input.jpg -o work/oemer/ 2>&1 | tail -n 40 || true
+          m=$(ls work/oemer/*.musicxml 2>/dev/null | head -1)
+          if [ -n "$m" ] && [ -s "$m" ]; then
+            python3 work/seal.py enc "$m" "$d/oemer.musicxml.bin"
+          else
+            echo "READER: No music recognized." > "$d/oemer.err.txt"
+          fi
+
+      # ------------------------------------------------------------- results
       - name: Report failure
         if: failure()
         run: |
           mkdir -p "jobs/$JOB_ID"
-          echo "READER: The reader crashed - please try again." > "jobs/$JOB_ID/error.txt"
+          ls "jobs/$JOB_ID/$ENGINE".* >/dev/null 2>&1 && [ ! -f "jobs/$JOB_ID/input.bin" ] || true
+          [ -f "jobs/$JOB_ID/$ENGINE.mxl.bin" ] || [ -f "jobs/$JOB_ID/$ENGINE.musicxml.bin" ] || \
+            echo "READER: This engine crashed - please try again." > "jobs/$JOB_ID/$ENGINE.err.txt"
 
       - name: Save result
         if: always()
@@ -141,8 +223,8 @@ jobs:
           git config user.name "sheet-omr"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A "jobs/$JOB_ID"
-          git commit -q -m "OMR result $JOB_ID" || exit 0
-          for i in 1 2 3 4 5 6; do
+          git commit -q -m "OMR $ENGINE result $JOB_ID" || exit 0
+          for i in 1 2 3 4 5 6 7 8; do
             git pull -q --rebase origin "${GITHUB_REF_NAME}" && git push -q origin "HEAD:${GITHUB_REF_NAME}" && exit 0
             sleep $((i * 3))
           done
