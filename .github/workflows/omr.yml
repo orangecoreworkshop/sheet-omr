@@ -16,7 +16,7 @@ on:
       engines:
         description: "Comma-separated engines"
         required: false
-        default: "audiveris,homr,oemer"
+        default: "homr"
 
 permissions:
   contents: write
