@@ -1,0 +1,33 @@
+# .github/workflows/cleanup.yml
+# Once a day, deletes job folders (photos and results) older than one day.
+name: Clean up old OMR jobs
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Remove jobs older than 1 day
+        run: |
+          [ -d jobs ] || exit 0
+          cutoff=$(( $(date +%s) - 86400 ))
+          n=0
+          for d in jobs/*/; do
+            t=$(git log -1 --format=%ct -- "$d")
+            if [ -n "$t" ] && [ "$t" -lt "$cutoff" ]; then git rm -rq "$d"; n=$((n+1)); fi
+          done
+          [ "$n" -gt 0 ] || { echo "Nothing to remove"; exit 0; }
+          git config user.name "sheet-omr"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Remove $n old OMR jobs"
+          git push -q
