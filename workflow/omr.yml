@@ -1,0 +1,122 @@
+# .github/workflows/omr.yml
+# Reads one photo of sheet music with Audiveris and saves the result as
+# jobs/<id>/result.mxl (or jobs/<id>/error.txt). Started by the sheet-omr Worker.
+name: OMR
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job id (set by the Worker)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: omr-${{ inputs.job_id }}
+
+jobs:
+  omr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - name: Check job id
+        run: |
+          [[ "$JOB_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "Bad job id"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            jobs/${{ inputs.job_id }}
+          sparse-checkout-cone-mode: false
+
+      - name: Find latest Audiveris release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          json=$(gh api repos/Audiveris/audiveris/releases/latest)
+          tag=$(echo "$json" | jq -r .tag_name)
+          url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("ubuntu.*24\\.04.*\\.deb$"; "i"))][0].browser_download_url // empty')
+          [ -n "$url" ] || url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("ubuntu.*\\.deb$"; "i"))][0].browser_download_url // empty')
+          [ -n "$url" ] || url=$(echo "$json" | jq -r '[.assets[] | select(.name | test("\\.deb$"; "i"))][0].browser_download_url // empty')
+          [ -n "$url" ] || { echo "No Linux .deb in Audiveris $tag"; echo "$json" | jq -r '.assets[].name'; exit 1; }
+          echo "Audiveris $tag -> $url"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Audiveris installer
+        uses: actions/cache@v4
+        with:
+          path: ~/audiveris.deb
+          key: audiveris-deb-${{ steps.rel.outputs.tag }}
+
+      - name: Install Audiveris
+        run: |
+          [ -s ~/audiveris.deb ] || curl -fsSL -o ~/audiveris.deb "${{ steps.rel.outputs.url }}"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$HOME/audiveris.deb" imagemagick xvfb
+          AUD=$(dpkg -L audiveris 2>/dev/null | grep -E '/bin/[Aa]udiveris$' | head -1)
+          [ -n "$AUD" ] || AUD=$(command -v audiveris || command -v Audiveris || true)
+          [ -n "$AUD" ] || { echo "Audiveris executable not found"; dpkg -L audiveris | head -50; exit 1; }
+          echo "AUD=$AUD" >> "$GITHUB_ENV"
+
+      - name: Recognize
+        run: |
+          d="jobs/$JOB_ID"
+          in=$(ls "$d"/input.* 2>/dev/null | head -1)
+          [ -n "$in" ] || { echo "READER: The photo didn't arrive." > "$d/error.txt"; exit 0; }
+          mkdir -p work out
+
+          # Clean up the photo: upright, grey, straightened, big enough, then a
+          # black-and-white version with local thresholding (handles uneven light).
+          convert "$in" -auto-orient -colorspace Gray -deskew 40% +repage \
+                  -resize '3000x3000<' -normalize work/gray.png
+          convert work/gray.png -lat 60x60-8% work/bw.png
+
+          run_aud () {
+            rm -rf out/*
+            timeout 300 xvfb-run -a "$AUD" -batch -export -output out "$1" >> work/log.txt 2>&1 || true
+            find out -name '*.mxl' | sort | head -1
+          }
+          m=""
+          for f in work/bw.png work/gray.png "$in"; do
+            echo "=== $f" >> work/log.txt
+            m=$(run_aud "$f")
+            [ -n "$m" ] && break
+          done
+
+          if [ -n "$m" ]; then
+            cp "$m" "$d/result.mxl"
+            echo "Result: $m"
+          else
+            if grep -qiE 'too low|resolution|interline' work/log.txt; then
+              echo "READER: The staff lines were too small or blurry - move closer so the staves fill the frame." > "$d/error.txt"
+            else
+              echo "READER: No music could be recognized - try a flatter, sharper photo in even light." > "$d/error.txt"
+            fi
+            tail -c 4000 work/log.txt >> "$d/error.txt"
+          fi
+          tail -n 40 work/log.txt
+
+      - name: Report failure
+        if: failure()
+        run: |
+          mkdir -p "jobs/$JOB_ID"
+          echo "READER: The reader crashed - please try again." > "jobs/$JOB_ID/error.txt"
+
+      - name: Save result
+        if: always()
+        run: |
+          git config user.name "sheet-omr"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A "jobs/$JOB_ID/result.mxl" "jobs/$JOB_ID/error.txt" 2>/dev/null || git add -A "jobs/$JOB_ID"
+          git commit -q -m "OMR result $JOB_ID" || exit 0
+          for i in 1 2 3 4 5 6; do
+            git pull -q --rebase origin "${GITHUB_REF_NAME}" && git push -q origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep $((i * 3))
+          done
+          exit 1
