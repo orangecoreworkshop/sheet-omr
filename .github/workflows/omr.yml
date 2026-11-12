@@ -59,10 +59,19 @@ jobs:
         run: |
           [ -s ~/audiveris.deb ] || curl -fsSL -o ~/audiveris.deb "${{ steps.rel.outputs.url }}"
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$HOME/audiveris.deb" imagemagick xvfb python3-cryptography
-          AUD=$(dpkg -L audiveris 2>/dev/null | grep -E '/bin/[Aa]udiveris$' | head -1)
-          [ -n "$AUD" ] || AUD=$(command -v audiveris || command -v Audiveris || true)
-          [ -n "$AUD" ] || { echo "Audiveris executable not found"; dpkg -L audiveris | head -50; exit 1; }
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq imagemagick xvfb python3-cryptography libasound2t64
+          # The installer's last step adds a desktop menu icon, which fails on a
+          # server with no desktop. Give it the folders it wants; if it still
+          # fails, unpack the program files directly (the menu icon isn't needed).
+          sudo mkdir -p /etc/xdg/menus /usr/share/desktop-directories /usr/share/applications /usr/share/icons/hicolor
+          if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$HOME/audiveris.deb"; then
+            echo "Package setup step failed - unpacking the program files directly"
+            sudo dpkg-deb -x "$HOME/audiveris.deb" /
+          fi
+          AUD=/opt/audiveris/bin/Audiveris
+          [ -x "$AUD" ] || AUD=$(dpkg-deb -c "$HOME/audiveris.deb" | awk '{print $NF}' | sed 's#^\.##' | grep -E '/bin/[Aa]udiveris$' | head -1)
+          [ -n "$AUD" ] && [ -x "$AUD" ] || { echo "Audiveris executable not found"; dpkg-deb -c "$HOME/audiveris.deb" | head -40; exit 1; }
+          echo "Using $AUD"
           echo "AUD=$AUD" >> "$GITHUB_ENV"
 
       - name: Write crypto helper
