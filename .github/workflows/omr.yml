@@ -161,24 +161,31 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/venv-homr
-          key: venv-homr-0.7.1-py311-v1
+          key: venv-homr-0.7.1-py311-v2
+
+      - name: Install homr
+        if: matrix.engine == 'homr'
+        run: |
+          if [ ! -x ~/venv-homr/bin/homr ]; then
+            python -m venv ~/venv-homr
+            ~/venv-homr/bin/pip install -q --upgrade pip
+            ~/venv-homr/bin/pip install -q "homr[cpu]==0.7.1"
+          fi
+          ~/venv-homr/bin/homr --init --no-title > work/homr-init.log 2>&1 || { tail -n 30 work/homr-init.log; exit 1; }
+          echo "homr ready"
 
       - name: Read with homr
         if: matrix.engine == 'homr'
         run: |
           d="jobs/$JOB_ID"
           [ -f work/input.jpg ] || exit 0
-          if [ ! -x ~/venv-homr/bin/homr ]; then
-            python -m venv ~/venv-homr
-            ~/venv-homr/bin/pip install -q --upgrade pip
-            ~/venv-homr/bin/pip install -q "homr[cpu]==0.7.1"
-          fi
-          ~/venv-homr/bin/homr --init --no-title
-          timeout 900 ~/venv-homr/bin/homr --no-title work/input.jpg 2>&1 | tail -n 40 || true
+          timeout 900 ~/venv-homr/bin/homr --no-title work/input.jpg > work/homr.log 2>&1 || true
+          tail -n 40 work/homr.log
           if [ -s work/input.musicxml ]; then
             /usr/bin/python3 work/seal.py enc work/input.musicxml "$d/homr.musicxml.bin"
           else
-            echo "READER: No music recognized." > "$d/homr.err.txt"
+            why=$(grep -E "Error|Exception|error:" work/homr.log | tail -1 | cut -c1-200)
+            echo "READER: No music recognized.${why:+ ($why)}" > "$d/homr.err.txt"
           fi
 
       # ---------------------------------------------------------------- oemer
@@ -187,25 +194,44 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/venv-oemer
-          key: venv-oemer-0.1.8-py311-v1
+          key: venv-oemer-0.1.8-py311-cpu-v2
+
+      - name: Install oemer
+        if: matrix.engine == 'oemer'
+        run: |
+          if [ ! -x ~/venv-oemer/bin/oemer ]; then
+            python -m venv ~/venv-oemer
+            ~/venv-oemer/bin/pip install -q --upgrade pip
+            ~/venv-oemer/bin/pip install -q "oemer==0.1.8" "numpy<2"
+            # GitHub's servers have no graphics card: swap in the plain CPU runtime
+            ~/venv-oemer/bin/pip uninstall -q -y onnxruntime-gpu || true
+            ~/venv-oemer/bin/pip install -q onnxruntime "numpy<2"
+          fi
+          pkg=$(~/venv-oemer/bin/python -c "import oemer, os; print(os.path.dirname(oemer.__file__))")
+          base=https://github.com/BreezeWhite/oemer/releases/download/checkpoints
+          mkdir -p "$pkg/checkpoints/unet_big" "$pkg/checkpoints/seg_net"
+          get () { [ -s "$2" ] || curl -fsSL -o "$2" "$base/$1"; }
+          get 1st_model.onnx   "$pkg/checkpoints/unet_big/model.onnx"
+          get 1st_weights.h5   "$pkg/checkpoints/unet_big/weights.h5"
+          get 2nd_model.onnx   "$pkg/checkpoints/seg_net/model.onnx"
+          get 2nd_weights.h5   "$pkg/checkpoints/seg_net/weights.h5"
+          ls -la "$pkg/checkpoints/unet_big" "$pkg/checkpoints/seg_net"
+          ~/venv-oemer/bin/python -c "import onnxruntime as o; print('onnxruntime', o.__version__, o.get_available_providers())"
 
       - name: Read with oemer
         if: matrix.engine == 'oemer'
         run: |
           d="jobs/$JOB_ID"
           [ -f work/input.jpg ] || exit 0
-          if [ ! -x ~/venv-oemer/bin/oemer ]; then
-            python -m venv ~/venv-oemer
-            ~/venv-oemer/bin/pip install -q --upgrade pip
-            ~/venv-oemer/bin/pip install -q "oemer==0.1.8" "numpy<2"
-          fi
           mkdir -p work/oemer
-          timeout 1200 ~/venv-oemer/bin/oemer work/input.jpg -o work/oemer/ 2>&1 | tail -n 40 || true
+          timeout 1200 ~/venv-oemer/bin/oemer work/input.jpg -o work/oemer/ > work/oemer.log 2>&1 || true
+          tr '\r' '\n' < work/oemer.log | grep -v -E "[0-9.]+% [0-9]+/" | tail -n 60
           m=$(ls work/oemer/*.musicxml 2>/dev/null | head -1)
           if [ -n "$m" ] && [ -s "$m" ]; then
             /usr/bin/python3 work/seal.py enc "$m" "$d/oemer.musicxml.bin"
           else
-            echo "READER: No music recognized." > "$d/oemer.err.txt"
+            why=$(tr '\r' '\n' < work/oemer.log | grep -E "Error|Exception" | tail -1 | cut -c1-200)
+            echo "READER: No music recognized.${why:+ ($why)}" > "$d/oemer.err.txt"
           fi
 
       # ------------------------------------------------------------- results
